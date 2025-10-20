@@ -1453,53 +1453,81 @@ def render_apply_to_leanchems_ui(user_id: str):
                     "next": parsed.get("next_scenarios", []) or []
                 }
 
-                # Render results (no auto-save)
-                st.subheader("✅ Information Extraction Matrix")
-                for i, layer in enumerate(parsed_data.get("layers", []), 1):
-                    with st.expander(f"Layer {i}: {layer.get('layer', 'Unknown')} (Coverage: {layer.get('coverage', 0)*100:.0f}%)"):
-                        elements = layer.get('elements', [])
-                        if elements:
-                            for element in elements:
-                                st.write(f"• {element}")
-                        else:
-                            st.write("No specific elements identified in this layer.")
+                # Store results in session to persist across reruns
+                st.session_state.apply_results = {
+                    "subject_id": subject_id,
+                    "subject_name": selected_subject_name,
+                    "narrative": narrative,
+                    "parsed_data": parsed_data,
+                    "coverage_score": coverage_score,
+                    "scenario_json": scenario_json
+                }
+                st.rerun()
 
-                st.subheader("📊 Coverage Status")
-                st.progress(min(max(int(coverage_score), 0), 100))
-                st.write(f"Overall Coverage: {coverage_score:.1f}%")
+        # Render results from session (if present)
+        results = st.session_state.get("apply_results")
+        if results:
+            parsed_data = results["parsed_data"]
+            coverage_score = results["coverage_score"]
+            scenario_json = results["scenario_json"]
 
-                st.subheader("🧭 Scenario Mapping")
-                current = scenario_json.get("current", {})
-                if current:
-                    st.write("**Current Situation:**")
-                    st.write(current.get("summary", "No current summary available."))
+            st.subheader("✅ Information Extraction Matrix")
+            for i, layer in enumerate(parsed_data.get("layers", []), 1):
+                with st.expander(f"Layer {i}: {layer.get('layer', 'Unknown')} (Coverage: {layer.get('coverage', 0)*100:.0f}%)"):
+                    elements = layer.get('elements', [])
+                    if elements:
+                        for element in elements:
+                            st.write(f"• {element}")
+                    else:
+                        st.write("No specific elements identified in this layer.")
 
-                next_scenarios = scenario_json.get("next", [])
-                if next_scenarios:
-                    st.write("**Potential Next Scenarios:**")
-                    for i, scenario in enumerate(next_scenarios, 1):
-                        try:
-                            confidence = float(scenario.get("confidence", 0)) * 100
-                        except Exception:
-                            confidence = 0
-                        st.write(f"{i}. **{scenario.get('scenario', 'Unknown')}** (Confidence: {confidence:.0f}%)")
+            st.subheader("📊 Coverage Status")
+            st.progress(min(max(int(coverage_score), 0), 100))
+            st.write(f"Overall Coverage: {coverage_score:.1f}%")
 
-                # Save button (manual persist)
-                if st.button("💾 Save Application", key="apply_save", type="primary"):
-                    record = {
-                        "id": str(uuid.uuid4()),
-                        "subject_id": subject_id,
-                        "input_text": narrative,
-                        "parsed_data": parsed_data,
-                        "coverage_score": coverage_score,
-                        "scenario_json": scenario_json,
-                        "created_at": datetime.datetime.now().isoformat()
-                    }
+            st.subheader("🧭 Scenario Mapping")
+            current = scenario_json.get("current", {})
+            if current:
+                st.write("**Current Situation:**")
+                st.write(current.get("summary", "No current summary available."))
+
+            next_scenarios = scenario_json.get("next", [])
+            if next_scenarios:
+                st.write("**Potential Next Scenarios:**")
+                for i, scenario in enumerate(next_scenarios, 1):
                     try:
-                        supabase_client.table('subject_application').insert(record).execute()
+                        confidence = float(scenario.get("confidence", 0)) * 100
+                    except Exception:
+                        confidence = 0
+                    st.write(f"{i}. **{scenario.get('scenario', 'Unknown')}** (Confidence: {confidence:.0f}%)")
+
+            # Save button (manual persist)
+            if st.button("💾 Save Application", key="apply_save", type="primary"):
+                record = {
+                    "id": str(uuid.uuid4()),
+                    "subject_id": results["subject_id"],
+                    "input_text": results["narrative"],
+                    "parsed_data": results["parsed_data"],
+                    "coverage_score": results["coverage_score"],
+                    "scenario_json": results["scenario_json"],
+                    "created_at": datetime.datetime.now().isoformat()
+                }
+                try:
+                    resp = supabase_client.table('subject_application').insert(record).execute()
+                    if getattr(resp, 'data', None):
                         st.success("Application saved.")
-                    except Exception as e:
-                        st.error(f"Failed to save application: {e}")
+                        # Clear inputs and outputs after save
+                        st.session_state.apply_results = None
+                        if 'apply_narrative' in st.session_state:
+                            st.session_state['apply_narrative'] = ""
+                        if 'apply_upload' in st.session_state:
+                            st.session_state['apply_upload'] = None
+                        # trigger a clean rerun to clear rendered output
+                        st.rerun()
+                    else:
+                        st.warning("Insert returned no data; verify RLS and table permissions.")
+                except Exception as e:
+                    st.error(f"Failed to save application: {e}")
 
 def render_ai_coach_ui(user_id: str):
     """Module 5: AI Coach on top of a selected application."""
@@ -1521,11 +1549,30 @@ def render_ai_coach_ui(user_id: str):
                 apps = resp.data or []
             except Exception as e:
                 st.error(f"Failed to load applications: {e}")
-            options = [f"{a['id']} | {a['created_at']} | {a.get('coverage_score', 'n/a')}%" for a in apps] or ["None"]
-            chosen = st.selectbox("Select Previous Application", options=options, key="coach_app_select")
-            if apps:
-                idx = options.index(chosen)
-                selected_app = apps[idx]
+
+            def _format_app_row(a: dict) -> str:
+                # Human-readable label: Date • Coverage
+                ts = a.get('created_at')
+                label_date = str(ts)
+                try:
+                    # Handle both with/without timezone 'Z'
+                    from datetime import datetime
+                    label_date = datetime.fromisoformat(ts.replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M') if ts else 'Unknown date'
+                except Exception:
+                    pass
+                cov = a.get('coverage_score')
+                try:
+                    cov_str = f"{float(cov):.1f}%" if cov is not None else "n/a"
+                except Exception:
+                    cov_str = "n/a"
+                return f"{label_date} • Coverage {cov_str}"
+
+            selected_app = st.selectbox(
+                "Select Previous Application",
+                options=apps if apps else [None],
+                format_func=(lambda a: _format_app_row(a) if isinstance(a, dict) else "None"),
+                key="coach_app_select"
+            )
         run = st.button("Analyze & Coach", key="coach_run", type="primary")
     with col2:
         if run and selected_app:
@@ -1538,27 +1585,59 @@ def render_ai_coach_ui(user_id: str):
                 "long_term": ["Institutionalize process", "Scale"]
             }
             recommendations_text = f"For {selected_subject_name}, focus on high impact/urgency gaps."
-            record = {
-                "id": str(uuid.uuid4()),
+
+            # Keep results in session, do not auto-save
+            st.session_state.coach_results = {
                 "subject_application_id": selected_app['id'],
                 "criticality_score": criticality_score,
                 "maturity_level": maturity_level,
                 "action_plan_json": action_plan_json,
-                "recommendations_text": recommendations_text,
-                "created_at": datetime.datetime.now().isoformat()
+                "recommendations_text": recommendations_text
             }
-            try:
-                supabase_client.table('subject_coach_analysis').insert(record).execute()
-                st.success("Coach analysis saved.")
-            except Exception as e:
-                st.error(f"Failed to save coach analysis: {e}")
+            st.rerun()
+
+        # Render from session if available
+        coach = st.session_state.get("coach_results")
+        if coach:
             st.subheader("📈 Maturity & Criticality")
-            st.metric("Criticality", f"{criticality_score:.1f}")
-            st.write(f"Maturity: {maturity_level}")
+            st.metric("Criticality", f"{coach['criticality_score']:.1f}")
+            st.write(f"Maturity: {coach['maturity_level']}")
+
             st.subheader("🧭 Recommended Strategy")
-            st.json(action_plan_json)
+            plan = coach.get("action_plan_json", {})
+            for section_key, section_title in [("short_term", "Short Term"), ("mid_term", "Mid Term"), ("long_term", "Long Term")]:
+                items = plan.get(section_key, [])
+                st.markdown(f"**{section_title}**")
+                if items:
+                    for i, itm in enumerate(items, 1):
+                        st.write(f"{i}. {itm}")
+                else:
+                    st.write("No actions listed.")
+
             st.subheader("📝 Narrative Recommendations")
-            st.write(recommendations_text)
+            st.write(coach.get("recommendations_text", ""))
+
+            if st.button("💾 Save Coach Analysis", key="coach_save", type="primary"):
+                record = {
+                    "id": str(uuid.uuid4()),
+                    "subject_application_id": coach['subject_application_id'],
+                    "criticality_score": coach['criticality_score'],
+                    "maturity_level": coach['maturity_level'],
+                    "action_plan_json": coach['action_plan_json'],
+                    "recommendations_text": coach['recommendations_text'],
+                    "created_at": datetime.datetime.now().isoformat()
+                }
+                try:
+                    resp = supabase_client.table('subject_coach_analysis').insert(record).execute()
+                    if getattr(resp, 'data', None):
+                        st.success("Coach analysis saved.")
+                        # Clear session and selections
+                        st.session_state.coach_results = None
+                        st.rerun()
+                    else:
+                        st.warning("Insert returned no data; verify RLS and table permissions.")
+                except Exception as e:
+                    st.error(f"Failed to save coach analysis: {e}")
 
 # Initialize session state
 if not st.session_state.get("messages", None):
