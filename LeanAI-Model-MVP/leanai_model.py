@@ -1362,44 +1362,144 @@ def render_apply_to_leanchems_ui(user_id: str):
         if run and selected_subject_name and narrative:
             with st.spinner("Analyzing and mapping to framework..."):
                 subject_id = subjects_dict[selected_subject_name]
-                # Placeholder parsed data and scenarios; replace with real LLM logic as needed
-                parsed_data = {
-                    "layers": [
-                        {"layer": "Context", "elements": [], "coverage": 0.6},
-                        {"layer": "Drivers", "elements": [], "coverage": 0.7},
-                        {"layer": "Metrics", "elements": [], "coverage": 0.9},
-                        {"layer": "Scenarios", "elements": [], "coverage": 0.8}
-                    ]
-                }
-                coverage_score = 85.0
-                scenario_json = {
-                    "current": {"summary": f"Current summary for {selected_subject_name}"},
-                    "next": [
-                        {"scenario": "Option A", "confidence": 0.7},
-                        {"scenario": "Option B", "confidence": 0.5}
-                    ]
-                }
-                record = {
-                    "id": str(uuid.uuid4()),
-                    "subject_id": subject_id,
-                    "input_text": narrative,
-                    "parsed_data": parsed_data,
-                    "coverage_score": coverage_score,
-                    "scenario_json": scenario_json,
-                    "created_at": datetime.datetime.now().isoformat()
-                }
+
+                # Read optional uploaded file content
+                file_text = ""
+                if uploaded_file is not None:
+                    try:
+                        file_text = extract_file_content(uploaded_file)
+                    except Exception as e:
+                        st.warning(f"Could not read uploaded file: {e}")
+
+                # LLM-driven parsing to structured layers
+                system_prompt = (
+                    "You are an information extraction system that structures a business narrative into layers: "
+                    "Context, Drivers, Metrics, Scenarios. Return strict JSON only."
+                )
+                user_prompt = (
+                    f"Subject: {selected_subject_name}\n\n"
+                    f"LeanChems Narrative:\n{narrative}\n\n"
+                    f"Supporting Document (optional, may be empty):\n{file_text[:3000]}"
+                    "\n\nReturn JSON with this schema: {\n"
+                    "  \"layers\": [\n"
+                    "    {\"layer\": \"Context\", \"elements\": [string...], \"coverage\": float 0-1},\n"
+                    "    {\"layer\": \"Drivers\", \"elements\": [string...], \"coverage\": float 0-1},\n"
+                    "    {\"layer\": \"Metrics\", \"elements\": [string...], \"coverage\": float 0-1},\n"
+                    "    {\"layer\": \"Scenarios\", \"elements\": [string...], \"coverage\": float 0-1}\n"
+                    "  ],\n"
+                    "  \"overall_coverage\": float 0-1,\n"
+                    "  \"current_summary\": string,\n"
+                    "  \"next_scenarios\": [{\"scenario\": string, \"confidence\": float 0-1}]\n"
+                    "}"
+                )
                 try:
-                    supabase_client.table('subject_application').insert(record).execute()
-                    st.success("Application saved.")
+                    ai_text = gemini_chat([
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ])
                 except Exception as e:
-                    st.error(f"Failed to save application: {e}")
+                    ai_text = "{}"
+
+                # Parse JSON robustly
+                def parse_json_safe(text: str):
+                    try:
+                        return json.loads(text)
+                    except Exception:
+                        # Try to locate first/last braces
+                        import re
+                        m = re.search(r"\{[\s\S]*\}", text)
+                        if m:
+                            try:
+                                return json.loads(m.group(0))
+                            except Exception:
+                                return {}
+                        return {}
+
+                parsed = parse_json_safe(ai_text) or {}
+                layers = parsed.get("layers", [])
+                # Fallback to expected layers if missing
+                wanted = ["Context", "Drivers", "Metrics", "Scenarios"]
+                if not layers:
+                    layers = [{"layer": w, "elements": [], "coverage": 0.0} for w in wanted]
+                # Normalize layer objects
+                norm_layers = []
+                for w in wanted:
+                    found = next((l for l in layers if str(l.get("layer", "")).lower() == w.lower()), None)
+                    if not found:
+                        norm_layers.append({"layer": w, "elements": [], "coverage": 0.0})
+                    else:
+                        elems = found.get("elements", [])
+                        if not isinstance(elems, list):
+                            elems = [str(elems)]
+                        cov = found.get("coverage", 0.0)
+                        try:
+                            cov = float(cov)
+                        except Exception:
+                            cov = 0.0
+                        cov = max(0.0, min(1.0, cov))
+                        norm_layers.append({"layer": w, "elements": [str(e) for e in elems], "coverage": cov})
+
+                parsed_data = {"layers": norm_layers}
+                overall_cov = parsed.get("overall_coverage")
+                try:
+                    coverage_score = float(overall_cov) * 100.0 if overall_cov is not None else (
+                        sum(l["coverage"] for l in norm_layers) / max(len(norm_layers), 1) * 100.0
+                    )
+                except Exception:
+                    coverage_score = 0.0
+
+                scenario_json = {
+                    "current": {"summary": parsed.get("current_summary", "")},
+                    "next": parsed.get("next_scenarios", []) or []
+                }
+
+                # Render results (no auto-save)
                 st.subheader("✅ Information Extraction Matrix")
-                st.json(parsed_data)
+                for i, layer in enumerate(parsed_data.get("layers", []), 1):
+                    with st.expander(f"Layer {i}: {layer.get('layer', 'Unknown')} (Coverage: {layer.get('coverage', 0)*100:.0f}%)"):
+                        elements = layer.get('elements', [])
+                        if elements:
+                            for element in elements:
+                                st.write(f"• {element}")
+                        else:
+                            st.write("No specific elements identified in this layer.")
+
                 st.subheader("📊 Coverage Status")
                 st.progress(min(max(int(coverage_score), 0), 100))
                 st.write(f"Overall Coverage: {coverage_score:.1f}%")
+
                 st.subheader("🧭 Scenario Mapping")
-                st.json(scenario_json)
+                current = scenario_json.get("current", {})
+                if current:
+                    st.write("**Current Situation:**")
+                    st.write(current.get("summary", "No current summary available."))
+
+                next_scenarios = scenario_json.get("next", [])
+                if next_scenarios:
+                    st.write("**Potential Next Scenarios:**")
+                    for i, scenario in enumerate(next_scenarios, 1):
+                        try:
+                            confidence = float(scenario.get("confidence", 0)) * 100
+                        except Exception:
+                            confidence = 0
+                        st.write(f"{i}. **{scenario.get('scenario', 'Unknown')}** (Confidence: {confidence:.0f}%)")
+
+                # Save button (manual persist)
+                if st.button("💾 Save Application", key="apply_save", type="primary"):
+                    record = {
+                        "id": str(uuid.uuid4()),
+                        "subject_id": subject_id,
+                        "input_text": narrative,
+                        "parsed_data": parsed_data,
+                        "coverage_score": coverage_score,
+                        "scenario_json": scenario_json,
+                        "created_at": datetime.datetime.now().isoformat()
+                    }
+                    try:
+                        supabase_client.table('subject_application').insert(record).execute()
+                        st.success("Application saved.")
+                    except Exception as e:
+                        st.error(f"Failed to save application: {e}")
 
 def render_ai_coach_ui(user_id: str):
     """Module 5: AI Coach on top of a selected application."""
