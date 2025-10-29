@@ -206,6 +206,11 @@ h1, h2, h3, h4 {
 </style>
 """, unsafe_allow_html=True)
 
+# Module-level notification scheduler state to avoid multiple threads/jobs
+_notif_scheduler_started_global = False
+_notif_scheduler_thread = None
+_notif_scheduler_lock = threading.Lock()
+
 # Load environment variables
 project_root = Path(__file__).resolve().parent.parent
 dotenv_path = project_root / '.env'
@@ -404,7 +409,9 @@ def generate_daily_deal_summary():
         customers = get_all_customer_data()
         
         if not customers:
-            return "No customers found in the system."
+            # No customers -> don't produce a notification payload
+            print("generate_daily_deal_summary: no customers found; skipping summary generation")
+            return None
         
         # Collect deal information from all customers
         all_deals = []
@@ -512,8 +519,14 @@ def send_daily_notification():
     
     try:
         summary = generate_daily_deal_summary()
+
+        # Skip sending when there's no content to share
+        if not summary:
+            print("send_daily_notification: no summary to send; skipping Telegram notification")
+            return
+
         success = send_telegram_message_sync(summary)
-        
+
         if success:
             print(f"Daily notification sent successfully at {datetime.datetime.now()}")
         else:
@@ -626,33 +639,49 @@ def send_new_customer_notification(customer_name: str, customer_id: str, actor: 
 def start_notification_scheduler():
     """Start the notification scheduler in a separate thread"""
     # Prevent spawning multiple scheduler threads on Streamlit reruns
-    # Use session_state (persists across reruns) instead of plain globals
-    try:
-        started = st.session_state.get("_notif_scheduler_started", False)
-    except Exception:
-        started = False
-    if started:
-        return
+    # Use both a module-level flag and session_state to reduce duplicates
+    global _notif_scheduler_started_global, _notif_scheduler_thread
+
     if not NOTIFICATION_ENABLED:
         print("Notifications are disabled - scheduler not started")
         return
-    
-    def run_scheduler():
-        # Schedule daily notification at 8:00 AM
-        schedule.every().day.at("08:00").do(send_daily_notification)
-        
-        while True:
-            schedule.run_pending()
-            time.sleep(60)  # Check every minute
-    
-    # Start scheduler in a separate thread
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    try:
-        st.session_state["_notif_scheduler_started"] = True
-    except Exception:
-        pass
-    print("Notification scheduler started")
+
+    # Acquire lock so only one caller can start the scheduler
+    with _notif_scheduler_lock:
+        if _notif_scheduler_started_global:
+            print("Notification scheduler already started (global)")
+            return
+
+        # Clear previously scheduled daily jobs to avoid duplicates
+        try:
+            schedule.clear('daily_notification')
+        except Exception:
+            schedule.clear()
+
+        def run_scheduler():
+            # Schedule daily notification at 08:00 local time and tag it
+            try:
+                schedule.every().day.at("08:00").do(send_daily_notification).tag('daily_notification')
+            except Exception as e:
+                print(f"Failed to schedule daily notification: {e}")
+
+            while True:
+                try:
+                    schedule.run_pending()
+                except Exception as e:
+                    print(f"Scheduler run_pending error: {e}")
+                time.sleep(60)
+
+        _notif_scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+        _notif_scheduler_thread.start()
+        _notif_scheduler_started_global = True
+
+        try:
+            st.session_state["_notif_scheduler_started"] = True
+        except Exception:
+            pass
+
+        print("Notification scheduler started")
 
 # Cache OpenAI client and Memory instance
 @st.cache_resource
@@ -3359,3 +3388,45 @@ except Exception as e:
 if __name__ == "__main__":
     # This section won't run in Streamlit
     pass
+
+# --- TEST: Simulate daily notification logic ---
+def test_daily_notification_simulation():
+    """Simulate daily notification logic for empty and non-empty customer lists."""
+    import types
+
+    # Backup original get_all_customer_data
+    orig_get_all_customer_data = globals().get('get_all_customer_data')
+
+    # Case 1: No customers
+    def fake_get_all_customer_data_empty():
+        print("[TEST] get_all_customer_data() returns [] (no customers)")
+        return []
+    globals()['get_all_customer_data'] = fake_get_all_customer_data_empty
+    print("\n[TEST] --- Simulating daily notification with NO customers ---")
+    send_daily_notification()
+
+    # Case 2: Some customers with deals
+    def fake_get_all_customer_data_some():
+        print("[TEST] get_all_customer_data() returns sample customers")
+        return [
+            {
+                'customer_name': 'Sika Abysinia Ethiopia',
+                'interaction_metadata': [
+                    {'output': 'CURRENT DEALS:\n| Deal_ID | Product | Qty | Price | Stage | Progress | Last_Update |\n|---|---|---|---|---|---|---|\n| D-001 | RDP | N/A | N/A | Open | RFQ received | 2025-10-29 |\nCLOSED DEALS:\n| Deal_ID | Product | Outcome | Qty | Price | Progress |\n|---|---|---|---|---|---|\n| D-002 | HPMC | Won | 1000 kg | $5000 | Sample delivered |'}
+                ]
+            },
+            {
+                'customer_name': 'SOLVOCHEM',
+                'interaction_metadata': [
+                    {'output': 'CURRENT DEALS:\n| Deal_ID | Product | Qty | Price | Stage | Progress | Last_Update |\n|---|---|---|---|---|---|---|\n| D-003 | THINNER MIX | 500 kg | $2000 | InProcess | Quote sent | 2025-10-29 |'}
+                ]
+            }
+        ]
+    globals()['get_all_customer_data'] = fake_get_all_customer_data_some
+    print("\n[TEST] --- Simulating daily notification with SOME customers ---")
+    send_daily_notification()
+
+    # Restore original
+    if orig_get_all_customer_data:
+        globals()['get_all_customer_data'] = orig_get_all_customer_data
+    print("\n[TEST] --- Simulation complete ---\n")
