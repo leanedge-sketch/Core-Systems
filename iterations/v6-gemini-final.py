@@ -280,24 +280,89 @@ def can_show_notification_test_ui():
         # If anything goes wrong, default to safe: hide
         return False
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def gemini_chat(messages):
     """Call Gemini chat API with OpenAI-style messages."""
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set in environment.")
-    # Gemini expects a different message format
-    # We'll concatenate all messages into a single prompt
-    prompt = "\n".join([m['content'] for m in messages])
+    
+    # Convert OpenAI-style messages to Gemini format
+    # Gemini doesn't support system messages, so we combine system + user into one user message
+    prompt_parts = []
+    for msg in messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+        if role == 'system':
+            # Prepend system message with a clear label
+            prompt_parts.append(f"[System Instructions]\n{content}\n[/System Instructions]")
+        elif role == 'user':
+            prompt_parts.append(content)
+        elif role == 'assistant':
+            # For assistant messages in context, we can include them but Gemini expects a different format
+            # For now, just append as user context
+            prompt_parts.append(f"[Previous Response]\n{content}\n[/Previous Response]")
+    
+    # Combine all parts into a single prompt
+    prompt = "\n\n".join(prompt_parts)
+    
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
-    response = requests.post(GEMINI_CHAT_URL, params=params, headers=headers, data=json.dumps(payload))
-    response.raise_for_status()
-    candidates = response.json().get('candidates', [])
-    if candidates:
-        return candidates[0]['content']['parts'][0]['text']
-    return "[No response from Gemini]"
+    
+    try:
+        response = requests.post(
+            GEMINI_CHAT_URL, 
+            params=params, 
+            headers=headers, 
+            data=json.dumps(payload),
+            timeout=60
+        )
+        
+        # Check status code and handle errors gracefully
+        if response.status_code != 200:
+            error_text = response.text
+            try:
+                error_json = response.json()
+                error_message = error_json.get('error', {}).get('message', error_text)
+                error_code = error_json.get('error', {}).get('code', response.status_code)
+                raise requests.exceptions.HTTPError(
+                    f"Gemini API Error {error_code}: {error_message}\n"
+                    f"Status Code: {response.status_code}\n"
+                    f"Full Response: {error_text[:500]}"
+                )
+            except (json.JSONDecodeError, KeyError):
+                raise requests.exceptions.HTTPError(
+                    f"Gemini API Error: Status {response.status_code}\n"
+                    f"Response: {error_text[:500]}"
+                )
+        
+        response_data = response.json()
+        candidates = response_data.get('candidates', [])
+        
+        if not candidates:
+            # Check if there's a blocking reason
+            if 'promptFeedback' in response_data:
+                feedback = response_data['promptFeedback']
+                if feedback.get('blockReason'):
+                    reason = feedback.get('blockReason')
+                    raise ValueError(f"Gemini blocked the prompt. Reason: {reason}")
+            return "[No response from Gemini - no candidates returned]"
+        
+        # Extract text from first candidate
+        candidate = candidates[0]
+        if 'content' in candidate and 'parts' in candidate['content']:
+            text_parts = [part.get('text', '') for part in candidate['content']['parts'] if 'text' in part]
+            if text_parts:
+                return ''.join(text_parts)
+        
+        return "[No response from Gemini - unexpected response format]"
+        
+    except requests.exceptions.Timeout:
+        raise requests.exceptions.Timeout("Gemini API request timed out after 60 seconds")
+    except requests.exceptions.RequestException as e:
+        raise requests.exceptions.RequestException(f"Error communicating with Gemini API: {str(e)}")
 
 def gemini_embed(text):
     if not GEMINI_API_KEY:
@@ -2380,13 +2445,33 @@ def render_update_interaction_ui(user_id: str):
             if st.button("💡 Analyze with AI", key="analyze_interaction_button") and new_interaction:
                 # Meta-query detection for summarize (always use selected customer)
                 if "summarize" in new_interaction.lower():
-                    summary = summarize_interactions_with_customer(customer_name, user_id)
-                    st.session_state['current_interaction_analysis'] = {
-                        'new_interaction': new_interaction,
-                        'deal_analysis': summary,
-                        'sales_stage_tracker': summary,
-                        'next_action_str': summary
-                    }
+                    try:
+                        summary = summarize_interactions_with_customer(customer_name, user_id)
+                        st.session_state['current_interaction_analysis'] = {
+                            'new_interaction': new_interaction,
+                            'deal_analysis': summary,
+                            'sales_stage_tracker': summary,
+                            'next_action_str': summary
+                        }
+                    except requests.exceptions.HTTPError as e:
+                        error_msg = str(e)
+                        st.error(f"❌ Gemini API Error: {error_msg}")
+                        st.warning("⚠️ Please check your GEMINI_API_KEY and try again.")
+                        st.session_state['current_interaction_analysis'] = {
+                            'new_interaction': new_interaction,
+                            'deal_analysis': f"Error: Could not summarize. {error_msg}",
+                            'sales_stage_tracker': f"Error: {error_msg}",
+                            'next_action_str': f"Error: {error_msg}"
+                        }
+                    except Exception as e:
+                        error_msg = str(e)
+                        st.error(f"❌ Error summarizing interactions: {error_msg}")
+                        st.session_state['current_interaction_analysis'] = {
+                            'new_interaction': new_interaction,
+                            'deal_analysis': f"Error: {error_msg}",
+                            'sales_stage_tracker': f"Error: {error_msg}",
+                            'next_action_str': f"Error: {error_msg}"
+                        }
                     st.rerun()
                 with st.spinner("Analyzing interaction or answering your question..."):
                     # 1. Retrieve relevant past interactions for context (always use selected customer)
@@ -2403,26 +2488,69 @@ def render_update_interaction_ui(user_id: str):
 
                     if is_question or is_summarize or is_latest:
                         # Use open-ended RAG answer for questions and meta-queries
-                        open_answer = answer_any_query_with_rag(new_interaction, customer_id, user_id, top_k=3)
-                        st.session_state['current_interaction_analysis'] = {
-                            'new_interaction': new_interaction,
-                            'deal_analysis': open_answer,
-                            'sales_stage_tracker': open_answer,
-                            'next_action_str': open_answer
-                        }
+                        try:
+                            open_answer = answer_any_query_with_rag(new_interaction, customer_id, user_id, top_k=3)
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': open_answer,
+                                'sales_stage_tracker': open_answer,
+                                'next_action_str': open_answer
+                            }
+                        except requests.exceptions.HTTPError as e:
+                            error_msg = str(e)
+                            st.error(f"❌ Gemini API Error: {error_msg}")
+                            st.warning("⚠️ Please check your GEMINI_API_KEY and try again.")
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': f"Error: Could not answer query. {error_msg}",
+                                'sales_stage_tracker': f"Error: {error_msg}",
+                                'next_action_str': f"Error: {error_msg}"
+                            }
+                        except Exception as e:
+                            error_msg = str(e)
+                            st.error(f"❌ Error answering query: {error_msg}")
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': f"Error: {error_msg}",
+                                'sales_stage_tracker': f"Error: {error_msg}",
+                                'next_action_str': f"Error: {error_msg}"
+                            }
                     else:
                         # Always run classic sales analysis for normal sales interactions
-                        last_deal_block = interactions[-1]['llm_output_summary'] if interactions else ""
-                        deal_analysis = analyze_deals_multi(new_interaction, past_context,last_deal_block)
-                        last_stage_block = interactions[-1]['llm_output_summary'] if interactions else ""
-                        stage_narrative = sales_stage_tracker(new_interaction, past_context, last_stage_block)
-                        next_action_str = suggest_next_action(new_interaction, past_context, deal_analysis, stage_narrative)
-                        st.session_state['current_interaction_analysis'] = {
-                            'new_interaction': new_interaction,
-                            'deal_analysis': deal_analysis,
-                            'sales_stage_tracker': stage_narrative,
-                            'next_action_str': next_action_str
-                        }
+                        try:
+                            last_deal_block = interactions[-1]['llm_output_summary'] if interactions else ""
+                            deal_analysis = analyze_deals_multi(new_interaction, past_context,last_deal_block)
+                            last_stage_block = interactions[-1]['llm_output_summary'] if interactions else ""
+                            stage_narrative = sales_stage_tracker(new_interaction, past_context, last_stage_block)
+                            next_action_str = suggest_next_action(new_interaction, past_context, deal_analysis, stage_narrative)
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': deal_analysis,
+                                'sales_stage_tracker': stage_narrative,
+                                'next_action_str': next_action_str
+                            }
+                        except requests.exceptions.HTTPError as e:
+                            error_msg = str(e)
+                            st.error(f"❌ Gemini API Error: {error_msg}")
+                            st.warning("⚠️ Please check your GEMINI_API_KEY and try again. The analysis could not be completed.")
+                            # Store a partial analysis with error message
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': f"Error: Could not analyze deals. {error_msg}",
+                                'sales_stage_tracker': f"Error: Could not analyze sales stage. {error_msg}",
+                                'next_action_str': f"Error: Could not suggest next action. {error_msg}"
+                            }
+                        except Exception as e:
+                            error_msg = str(e)
+                            st.error(f"❌ Unexpected error during analysis: {error_msg}")
+                            st.warning("⚠️ Please try again. If the issue persists, contact support.")
+                            # Store a partial analysis with error message
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': f"Error: {error_msg}",
+                                'sales_stage_tracker': f"Error: {error_msg}",
+                                'next_action_str': f"Error: {error_msg}"
+                            }
                 st.rerun()
             st.markdown("\n---\n")
             st.subheader("Upload Document")
