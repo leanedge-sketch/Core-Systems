@@ -211,6 +211,10 @@ _notif_scheduler_started_global = False
 _notif_scheduler_thread = None
 _notif_scheduler_lock = threading.Lock()
 
+class GeminiServiceUnavailableError(Exception):
+    """Raised when Gemini returns 503 due to high demand."""
+    pass
+
 # Load environment variables
 project_root = Path(__file__).resolve().parent.parent
 dotenv_path = project_root / '.env'
@@ -283,8 +287,12 @@ def can_show_notification_test_ui():
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type((requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+    wait=wait_exponential(multiplier=2, min=2, max=8),
+    retry=retry_if_exception_type((
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
+        GeminiServiceUnavailableError
+    ))
 )
 def gemini_chat(messages):
     """Call Gemini chat API with OpenAI-style messages."""
@@ -332,6 +340,10 @@ def gemini_chat(messages):
                 error_json = response.json()
                 error_message = error_json.get('error', {}).get('message', error_text)
                 error_code = error_json.get('error', {}).get('code', response.status_code)
+                if response.status_code == 503:
+                    raise GeminiServiceUnavailableError(
+                        f"Gemini service unavailable (high demand): {error_message}"
+                    )
                 if response.status_code == 401:
                     if "Incorrect API key provided" in error_message or "openai" in error_message.lower():
                         raise PermissionError(
@@ -429,7 +441,7 @@ def gemini_embed(text):
 async def send_telegram_message(message: str):
     """Send a message via Telegram bot"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
-        print("Telegram bot token or chat ID not configured")
+        print("Warning: Telegram bot token or chat ID not configured; skipping notification.")
         return False
     
     try:
@@ -440,20 +452,20 @@ async def send_telegram_message(message: str):
                 await bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
                 any_success = True
             except Exception as e:
-                print(f"Error sending to chat_id {chat_id}: {str(e)}")
+                print(f"Warning: Telegram send failed for chat_id {chat_id}: {str(e)}")
                 continue
         return any_success
     except Exception as e:
-        print(f"Error sending Telegram message: {str(e)}")
+        print(f"Warning: Telegram async send failed: {str(e)}")
         return False
 
 def send_telegram_message_sync(message: str):
     """Send a Telegram message to all configured chat IDs via HTTP (multi-recipient)."""
     if not NOTIFICATION_ENABLED:
-        print("Notifications are disabled")
+        print("Warning: Notifications are disabled; skipping Telegram send.")
         return False
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
-        print("Telegram bot token or chat IDs not configured")
+        print("Warning: Telegram bot token or chat IDs not configured; skipping Telegram send.")
         return False
     try:
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -467,14 +479,14 @@ def send_telegram_message_sync(message: str):
                 }
                 resp = requests.post(api_url, json=payload, timeout=10)
                 if resp.status_code != 200:
-                    print(f"Error sending to {chat_id}: {resp.status_code} {resp.text[:200]}")
+                    print(f"Warning: Telegram API returned {resp.status_code} for {chat_id}: {resp.text[:200]}")
                 any_success = any_success or (resp.status_code == 200)
             except Exception as e:
-                print(f"Exception sending to {chat_id}: {str(e)}")
+                print(f"Warning: Telegram exception sending to {chat_id}: {str(e)}")
                 continue
         return any_success
     except Exception as e:
-        print(f"Error in sync Telegram send: {str(e)}")
+        print(f"Warning: Telegram sync send failed: {str(e)}")
         return False
 
 def generate_daily_deal_summary():
@@ -2234,54 +2246,74 @@ def update_customer_interaction(customer_id: str, new_input: str, new_output: st
         st.error(f"Supabase update error: {e}")
         raise
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def retrieve_relevant_interactions(customer_id: str, query: str, top_k: int = 3):
     """Retrieve the most relevant past interactions using vector similarity, returning full JSON objects."""
-    query_embedding = gemini_embed(query)
-    print("DEBUG: query_embedding from gemini_embed:", query_embedding, type(query_embedding))
-    import json
-    import numpy as np
-    if isinstance(query_embedding, str):
-        try:
-            query_embedding = json.loads(query_embedding)
-        except Exception:
-            query_embedding = [float(query_embedding)]
-    elif isinstance(query_embedding, float) or isinstance(query_embedding, int):
-        query_embedding = [query_embedding]
-    elif isinstance(query_embedding, np.ndarray):
-        query_embedding = query_embedding.tolist()
-    # Now query_embedding should be a list of floats
-    customer = supabase_client.table('customers').select("interaction_embeddings, interaction_metadata").eq('customer_id', customer_id).single().execute()
-    
-    if not customer.data:
+    try:
+        # Use Gemini embeddings only; never call OpenAI here.
+        query_embedding = gemini_embed(query)
+        print("DEBUG: query_embedding from gemini_embed:", type(query_embedding))
+        import json
+        import numpy as np
+
+        if isinstance(query_embedding, str):
+            try:
+                query_embedding = json.loads(query_embedding)
+            except Exception:
+                query_embedding = [float(query_embedding)]
+        elif isinstance(query_embedding, (float, int)):
+            query_embedding = [query_embedding]
+        elif isinstance(query_embedding, np.ndarray):
+            query_embedding = query_embedding.tolist()
+
+        customer = supabase_client.table('customers').select(
+            "interaction_embeddings, interaction_metadata"
+        ).eq('customer_id', customer_id).single().execute()
+
+        if not customer.data:
+            return []
+
+        embs = customer.data.get('interaction_embeddings', [])
+        metas = customer.data.get('interaction_metadata', [])
+        if not embs or not metas:
+            return []
+
+        # Keep lists aligned and skip invalid shapes gracefully.
+        min_len = min(len(embs), len(metas))
+        embs_np = np.array(embs[:min_len], dtype=float)
+        metas = metas[:min_len]
+        if embs_np.shape[0] == 0:
+            return []
+
+        query_np = np.array(query_embedding, dtype=float)
+        if query_np.ndim != 1:
+            query_np = query_np.flatten()
+        if embs_np.ndim != 2 or embs_np.shape[1] != query_np.shape[0]:
+            print(
+                "retrieve_relevant_interactions: embedding dimension mismatch "
+                f"(stored={embs_np.shape}, query={query_np.shape})"
+            )
+            return []
+
+        similarities = embs_np @ query_np / (
+            np.linalg.norm(embs_np, axis=1) * np.linalg.norm(query_np) + 1e-8
+        )
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+
+        results = []
+        for i in top_indices:
+            interaction_json = metas[i]
+            if not isinstance(interaction_json, dict):
+                try:
+                    interaction_json = json.loads(interaction_json)
+                except Exception:
+                    interaction_json = {"input": "", "output": str(interaction_json)}
+            interaction_json = dict(interaction_json)
+            interaction_json['similarity'] = float(similarities[i])
+            results.append(interaction_json)
+        return results
+    except Exception as e:
+        print(f"retrieve_relevant_interactions failed for customer {customer_id}: {str(e)}")
         return []
-
-    embs = customer.data.get('interaction_embeddings', [])
-    metas = customer.data.get('interaction_metadata', [])
-
-    if not embs or not metas:
-        return []
-
-    # Handle case where embeddings list is shorter than metadata list, or vice-versa
-    min_len = min(len(embs), len(metas))
-    embs_np = np.array(embs[:min_len])
-    metas = metas[:min_len]
-
-    if embs_np.shape[0] == 0:
-        return []
-
-    query_np = np.array(query_embedding)
-    similarities = embs_np @ query_np / (np.linalg.norm(embs_np, axis=1) * np.linalg.norm(query_np) + 1e-8)
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
-
-    # Return the full JSON object from metadata, adding similarity score
-    results = []
-    for i in top_indices:
-        interaction_json = metas[i]
-        interaction_json['similarity'] = float(similarities[i])
-        results.append(interaction_json)
-        
-    return results
 
 def extract_file_content(file):
     """Extract content from different file types"""
