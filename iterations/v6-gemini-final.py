@@ -1280,6 +1280,7 @@ def create_new_customer(customer_name: str, user_id: str):
             'customer_name': customer_name,
             'profile': None,
             'profile_generation_error': None,
+            'profile_generated': False,
             'confirmed': False
         }
 
@@ -1305,29 +1306,52 @@ def create_new_customer(customer_name: str, user_id: str):
             state['step'] = 2
             st.rerun()
     
-    # Step 2: Generate and save in one clean action
+    # Step 2: Generate profile, preview, then choose save/discard
     if state['step'] == 2:
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Generate AI Profile and Save Customer", type="primary"):
-                state['confirmed'] = True
-                state['step'] = 3
+            if st.button("Generate AI Profile", key=f"generate_profile_{customer_name}", type="primary"):
+                with st.spinner("Generating AI profile... Please wait"):
+                    try:
+                        state['profile'] = generate_customer_profile(customer_name, user_id)
+                        state['profile_generation_error'] = None
+                        state['profile_generated'] = True
+                    except Exception as e:
+                        state['profile'] = None
+                        state['profile_generation_error'] = str(e)
+                        state['profile_generated'] = False
         with col2:
-            if st.button("Cancel"):
+            if st.button("Cancel", key=f"cancel_create_{customer_name}"):
                 st.session_state.customer_creation_state = None
                 st.rerun()
-        if not state.get('confirmed'):
+
+        if state.get('profile_generation_error'):
+            st.error(f"Profile generation failed: {state['profile_generation_error']}")
             return None
+
+        if state.get('profile_generated') and state.get('profile'):
+            st.write("Generated Profile Preview:")
+            st.write(state['profile'])
+            save_col, discard_col = st.columns(2)
+            with save_col:
+                if st.button("Save Customer", key=f"save_customer_{customer_name}", type="primary"):
+                    state['confirmed'] = True
+                    state['step'] = 3
+                    st.rerun()
+            with discard_col:
+                if st.button("Discard Profile", key=f"discard_profile_{customer_name}"):
+                    st.session_state.customer_creation_state = None
+                    st.rerun()
+        return None
 
     # Step 3: Create database entry (silent background failures except main save failure)
     if state['step'] == 3 and state.get('confirmed'):
-        with st.spinner("Generating AI profile and saving customer... Please wait"):
+        with st.spinner("Saving customer... Please wait"):
             if not state.get('profile'):
-                try:
-                    state['profile'] = generate_customer_profile(customer_name, user_id)
-                except Exception as e:
-                    st.error(f"Profile generation failed: {str(e)}")
-                    return None
+                st.error("No generated profile found. Please generate the profile before saving.")
+                state['step'] = 2
+                state['confirmed'] = False
+                return None
 
             customer_id = generate_customer_id()
             display_id = generate_display_id()
@@ -1728,6 +1752,7 @@ def render_customer_creation_ui_tab(user_id):
                 'customer_name': new_customer_name,
                 'profile': None,
                 'profile_generation_error': None,
+                'profile_generated': False,
                 'confirmed': False
             }
             st.rerun()
