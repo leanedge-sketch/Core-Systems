@@ -2948,28 +2948,102 @@ def analyze_crm_data(query: str, user_id: str):
         return f"OpenAI error: {e}"
 
 def save_analysis_query(query: str, response: str, user_id: str):
-    """Save the analysis query and response to the deals table"""
-    try:
-        data = {
-            "input_log": query,
-            "ai_response_log": response,
-            "created_by": user_id,
-            "created_at": datetime.datetime.now().isoformat()
-        }
-        api_response = supabase_client.table('deals').insert(data).execute()
-        return api_response.data[0] if api_response.data else None
-    except Exception as e:
-        st.error(f"Error saving analysis query: {str(e)}")
-        return None
+    """Save analysis query/response with fallback across available tables."""
+    created_at = datetime.datetime.now().isoformat()
+
+    # Prefer configurable table; default to user_values (hinted by Supabase error),
+    # then fallback to legacy deals table if present.
+    preferred = os.getenv("ANALYSIS_QUERIES_TABLE", "user_values").strip() or "user_values"
+    table_candidates = []
+    for t in [preferred, "user_values", "deals"]:
+        if t not in table_candidates:
+            table_candidates.append(t)
+
+    last_error = None
+    for table_name in table_candidates:
+        try:
+            if table_name == "user_values":
+                record_value = {
+                    "input_log": query,
+                    "ai_response_log": response,
+                    "created_at": created_at
+                }
+                payload = {
+                    "user_id": user_id,
+                    "key": f"analysis_query:{created_at}",
+                    "value": json.dumps(record_value),
+                    "created_at": created_at
+                }
+            else:
+                payload = {
+                    "input_log": query,
+                    "ai_response_log": response,
+                    "created_by": user_id,
+                    "created_at": created_at
+                }
+
+            api_response = supabase_client.table(table_name).insert(payload).execute()
+            if api_response.data:
+                # Normalize return shape for UI
+                return {
+                    "input_log": query,
+                    "ai_response_log": response,
+                    "created_at": created_at
+                }
+        except Exception as e:
+            last_error = e
+            print(f"save_analysis_query failed on table '{table_name}': {str(e)}")
+            continue
+
+    st.warning("Could not persist this analysis query to database. The analysis result is still available on screen.")
+    if last_error:
+        print(f"save_analysis_query exhausted fallbacks: {str(last_error)}")
+    return None
 
 def get_saved_queries(user_id: str):
-    """Fetch saved analysis queries for the user"""
-    try:
-        response = supabase_client.table('deals').select('*').eq('created_by', user_id).order('created_at', desc=True).execute()
-        return response.data if response.data else []
-    except Exception as e:
-        st.error(f"Error fetching saved queries: {str(e)}")
-        return []
+    """Fetch saved analysis queries with fallback across available tables."""
+    preferred = os.getenv("ANALYSIS_QUERIES_TABLE", "user_values").strip() or "user_values"
+    table_candidates = []
+    for t in [preferred, "user_values", "deals"]:
+        if t not in table_candidates:
+            table_candidates.append(t)
+
+    for table_name in table_candidates:
+        try:
+            if table_name == "user_values":
+                response = supabase_client.table(table_name).select('*').eq('user_id', user_id).order('created_at', desc=True).execute()
+                rows = response.data if response.data else []
+                normalized = []
+                for row in rows:
+                    key = str(row.get("key", ""))
+                    if not key.startswith("analysis_query:"):
+                        continue
+                    raw_value = row.get("value")
+                    parsed = {}
+                    if isinstance(raw_value, dict):
+                        parsed = raw_value
+                    elif isinstance(raw_value, str):
+                        try:
+                            parsed = json.loads(raw_value)
+                        except Exception:
+                            parsed = {"ai_response_log": raw_value}
+                    normalized.append({
+                        "input_log": parsed.get("input_log", ""),
+                        "ai_response_log": parsed.get("ai_response_log", ""),
+                        "created_at": parsed.get("created_at") or row.get("created_at")
+                    })
+                if normalized:
+                    return normalized
+            else:
+                response = supabase_client.table(table_name).select('*').eq('created_by', user_id).order('created_at', desc=True).execute()
+                rows = response.data if response.data else []
+                if rows:
+                    return rows
+        except Exception as e:
+            print(f"get_saved_queries failed on table '{table_name}': {str(e)}")
+            continue
+
+    return []
 
 def render_analysis_ui(user_id: str):
     """Render the Analysis & Reporting window UI"""
