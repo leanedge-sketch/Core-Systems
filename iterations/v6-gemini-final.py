@@ -227,9 +227,10 @@ model = os.getenv('MODEL_CHOICE', 'gpt-3.5-turbo')
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', None)
 GEMINI_CHAT_MODEL = os.getenv('GEMINI_CHAT_MODEL', 'gemini-2.5-flash')
-GEMINI_EMBED_MODEL = os.getenv('GEMINI_EMBED_MODEL', 'text-embedding-004')
+GEMINI_EMBED_MODEL = os.getenv('GEMINI_EMBED_MODEL', 'embedding-001')
 GEMINI_CHAT_URL = f'https://generativelanguage.googleapis.com/v1/models/{GEMINI_CHAT_MODEL}:generateContent'
-GEMINI_EMBED_URL = f'https://generativelanguage.googleapis.com/v1/models/{GEMINI_EMBED_MODEL}:embedContent'
+_gemini_embed_model_path = GEMINI_EMBED_MODEL if GEMINI_EMBED_MODEL.startswith('models/') else f"models/{GEMINI_EMBED_MODEL}"
+GEMINI_EMBED_URL = f'https://generativelanguage.googleapis.com/v1/{_gemini_embed_model_path}:embedContent'
 
 # --- Telegram Notification Configuration ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', None)
@@ -397,7 +398,7 @@ def gemini_embed(text):
             timeout=30
         )
         if response.status_code != 200:
-            st.error(f"Gemini API Error: {response.status_code} - {response.text}")
+            print(f"Gemini embedding API error {response.status_code}: {response.text}")
             response.raise_for_status()
         response_data = response.json()
         print("DEBUG: Gemini embed API raw response:", response_data)  # <--- Debug print
@@ -406,25 +407,22 @@ def gemini_embed(text):
         elif 'data' in response_data:
             embedding = response_data['data'][0].get('embedding', None)
         else:
-            st.error(f"Unexpected response format: {response_data}")
+            print(f"Unexpected Gemini embedding response format: {response_data}")
             raise ValueError("No embedding found in response")
         if not embedding:
             raise ValueError("No embedding returned from Gemini API")
         return embedding
     except requests.exceptions.ConnectionError as e:
-        st.error(f"Connection error to Gemini API: {str(e)}")
-        st.warning("Please check your internet connection and Gemini API key.")
+        print(f"Connection error to Gemini embedding API: {str(e)}")
         raise
     except requests.exceptions.Timeout as e:
-        st.error(f"Timeout error to Gemini API: {str(e)}")
-        st.warning("The request to Gemini API timed out. Please try again.")
+        print(f"Timeout error to Gemini embedding API: {str(e)}")
         raise
     except requests.exceptions.RequestException as e:
-        st.error(f"Request error to Gemini API: {str(e)}")
-        st.warning("There was an error communicating with Gemini API.")
+        print(f"Request error to Gemini embedding API: {str(e)}")
         raise
     except Exception as e:
-        st.error(f"Unexpected error in gemini_embed: {str(e)}")
+        print(f"Unexpected error in gemini_embed: {str(e)}")
         raise
 
 # --- Telegram Notification Functions ---
@@ -780,6 +778,11 @@ def get_memory():
         st.warning("DATABASE_URL not set. Memory features are disabled.")
         return NoopMemory()
 
+    # mem0 provider support can vary by version; when running Gemini mode,
+    # disable memory backend to avoid OpenAI-auth related background errors.
+    if LLM_PROVIDER == 'gemini':
+        return NoopMemory()
+
     llm_model = GEMINI_CHAT_MODEL if LLM_PROVIDER == 'gemini' else model
 
     config = {
@@ -945,7 +948,7 @@ def search_web_for_company(company_name: str):
             web_context += "---\n"
         return web_context
     except Exception as e:
-        st.warning(f"Web search failed: {str(e)}")
+        print(f"Web search failed for '{company_name}': {str(e)}")
         return ""
 
 def search_linkedin_profiles_ethiopia(company_name: str):
@@ -969,10 +972,10 @@ def search_linkedin_profiles_ethiopia(company_name: str):
         serpapi_key = os.getenv("SERPAPI_API_KEY")
 
         if not pse_api_key or not pse_cx:
-            st.warning("Google Custom Search API keys (GOOGLE_PSE_API_KEY, GOOGLE_PSE_CX) are not set. LinkedIn search may be incomplete.")
+            print("Google Custom Search API keys are not set. LinkedIn search may be incomplete.")
         
         if not serpapi_key:
-            st.warning("SerpAPI key (SERPAPI_API_KEY) is not set. LinkedIn search may be incomplete.")
+            print("SerpAPI key is not set. LinkedIn search may be incomplete.")
 
         # 1. Google PSE Search
         if pse_api_key and pse_cx:
@@ -1058,7 +1061,8 @@ def search_linkedin_profiles_ethiopia(company_name: str):
             
         return linkedin_context
     except Exception as e:
-        return f"\nLinkedIn Profiles in Ethiopia:\nSearch Error: {str(e)}\n"
+        print(f"LinkedIn search failed for '{company_name}': {str(e)}")
+        return ""
 
 def generate_customer_profile(customer_name: str, user_id: str):
     """Generate a customer profile using AI, existing conversations, and web search"""
@@ -1067,7 +1071,7 @@ def generate_customer_profile(customer_name: str, user_id: str):
     try:
         relevant_memories = get_cached_memories(customer_name, user_id)
     except Exception as e:
-        st.warning(f"Memory retrieval failed during profile generation: {str(e)}")
+        print(f"Memory retrieval failed during profile generation: {str(e)}")
         relevant_memories = {"results": []}
     
     # Search web for company information
@@ -1301,100 +1305,78 @@ def create_new_customer(customer_name: str, user_id: str):
             state['step'] = 2
             st.rerun()
     
-    # Step 2: Generate customer profile
+    # Step 2: Generate and save in one clean action
     if state['step'] == 2:
-        with st.spinner("Generating customer profile..."):
-            if state.get('profile') is None and state.get('profile_generation_error') is None:
-                try:
-                    profile = generate_customer_profile(customer_name, user_id)
-                    state['profile'] = profile
-                    state['profile_generation_error'] = None
-                except Exception as e:
-                    state['profile_generation_error'] = str(e)
-                    state['profile'] = (
-                        f"Profile generation unavailable for {customer_name}. "
-                        "Customer can still be created and enriched later."
-                    )
-
-            if state.get('profile_generation_error'):
-                st.error(f"Profile generation failed: {state['profile_generation_error']}")
-                st.warning("You can continue and save the customer without an AI-generated profile.")
-                st.write("Fallback Profile:")
-                st.write(state['profile'])
-            else:
-                st.write("Generated Profile:")
-                st.write(state['profile'])
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                confirm_label = "Confirm and Add to CRM"
-                if state.get('profile_generation_error'):
-                    confirm_label = "Continue Without AI Profile"
-                if st.button(confirm_label):
-                    state['confirmed'] = True
-                    state['step'] = 3
-                    st.rerun()
-            with col2:
-                if st.button("Cancel"):
-                    st.session_state.customer_creation_state = None
-                    st.rerun()
-            return None
-    
-    # Step 3: Create database entry
-    if state['step'] == 3 and state['confirmed']:
-        customer_id = generate_customer_id()
-        display_id = generate_display_id()
-        profile_input = f"Create profile for {customer_name}"
-        profile_output = str(state.get('profile') or f"Customer {customer_name} created without AI profile.")
-        # --- Generate embedding for the profile input ---
-        interaction_embeddings = []
-        try:
-            embedding = gemini_embed(profile_input)
-            embedding = ensure_vector(embedding)
-            interaction_embeddings = [embedding]  # Always a list of lists
-        except Exception as e:
-            st.warning(
-                f"Customer will be saved without embeddings because embedding generation failed: {str(e)}"
-            )
-        # Remove debug print
-        # print("DEBUG: embedding to be saved:", embedding, type(embedding))
-        interaction_json = {
-            "input": profile_input,
-            "output": profile_output,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "user_id": user_id
-        }
-        data = {
-            "customer_id": customer_id,
-            "display_id": display_id,
-            "customer_name": customer_name,
-            "input_conversation": [profile_input],
-            "output_conversation": [profile_output],
-            "interaction_metadata": [interaction_json],  # list of dicts (JSON)
-            "interaction_embeddings": interaction_embeddings  # list of lists of floats (vector per interaction)
-        }
-        try:
-            response = supabase_client.table('customers').insert(data).execute()
-            if response.data:
-                # Clear the creation state first
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Generate AI Profile and Save Customer", type="primary"):
+                state['confirmed'] = True
+                state['step'] = 3
+        with col2:
+            if st.button("Cancel"):
                 st.session_state.customer_creation_state = None
-
-                # Send new customer notification with actor and profile summary
-                try:
-                    actor = get_actor_display(user_id)
-                    created_at = datetime.datetime.now()
-                    profile_summary = profile_output
-                    send_new_customer_notification(customer_name, display_id, actor, created_at, profile_summary)
-                except Exception:
-                    send_new_customer_notification(customer_name, display_id)
-                
-                return response.data[0]
-            else:
-                st.error("Failed to create customer")
-                return None
-        except Exception as e:
-            st.error(f"Error creating customer: {str(e)}")
+                st.rerun()
+        if not state.get('confirmed'):
             return None
+
+    # Step 3: Create database entry (silent background failures except main save failure)
+    if state['step'] == 3 and state.get('confirmed'):
+        with st.spinner("Generating AI profile and saving customer... Please wait"):
+            if not state.get('profile'):
+                try:
+                    state['profile'] = generate_customer_profile(customer_name, user_id)
+                except Exception as e:
+                    st.error(f"Profile generation failed: {str(e)}")
+                    return None
+
+            customer_id = generate_customer_id()
+            display_id = generate_display_id()
+            profile_input = f"Create profile for {customer_name}"
+            profile_output = str(state.get('profile') or f"Customer {customer_name} created without AI profile.")
+            # --- Generate embedding for the profile input ---
+            interaction_embeddings = []
+            try:
+                embedding = gemini_embed(profile_input)
+                embedding = ensure_vector(embedding)
+                interaction_embeddings = [embedding]  # Always a list of lists
+            except Exception as e:
+                print(f"Embedding generation failed during customer save: {str(e)}")
+            interaction_json = {
+                "input": profile_input,
+                "output": profile_output,
+                "timestamp": datetime.datetime.now().isoformat(),
+                "user_id": user_id
+            }
+            data = {
+                "customer_id": customer_id,
+                "display_id": display_id,
+                "customer_name": customer_name,
+                "input_conversation": [profile_input],
+                "output_conversation": [profile_output],
+                "interaction_metadata": [interaction_json],  # list of dicts (JSON)
+                "interaction_embeddings": interaction_embeddings  # list of lists of floats (vector per interaction)
+            }
+            try:
+                response = supabase_client.table('customers').insert(data).execute()
+                if response.data:
+                    # Clear the creation state first
+                    st.session_state.customer_creation_state = None
+
+                    # Notification failure should not block save.
+                    try:
+                        actor = get_actor_display(user_id)
+                        created_at = datetime.datetime.now()
+                        profile_summary = profile_output
+                        send_new_customer_notification(customer_name, display_id, actor, created_at, profile_summary)
+                    except Exception as notify_err:
+                        print(f"Customer notification failed: {str(notify_err)}")
+                    return response.data[0]
+                else:
+                    st.error("Failed to create customer")
+                    return None
+            except Exception as e:
+                st.error(f"Error creating customer: {str(e)}")
+                return None
 
 # Authentication functions
 def sign_up(email, password, full_name):
@@ -1450,7 +1432,8 @@ def get_cached_memories(query, user_id):
     try:
         return memory.search(query=query, user_id=user_id, limit=2)
     except Exception as e:
-        st.error(f"Error retrieving memories: {str(e)}")
+        # Keep customer/profile flow usable even if memory backend is unavailable.
+        print(f"Memory retrieval disabled or failed: {str(e)}")
         return {"results": []}
 
 # Add retry decorator for API calls
@@ -1496,7 +1479,7 @@ def search_documents(query: str, user_id: str, limit: int = 3):
                 ).execute()
                 return response
             except Exception as rpc_error:
-                st.error(f"Supabase RPC error details: {str(rpc_error)}")
+                print(f"Supabase RPC error details: {str(rpc_error)}")
                 # Remove .message and .details accesses
                 # if hasattr(rpc_error, 'message'):
                 #     st.error(f"RPC Error message: {rpc_error.message}")
@@ -1509,8 +1492,7 @@ def search_documents(query: str, user_id: str, limit: int = 3):
         else:
             return []
     except Exception as e:
-        st.error(f"Document search failed: {str(e)}")
-        st.error("Please check your internet connection and try again.")
+        print(f"Document search failed: {str(e)}")
         return []
 
 # --- Customer management functions ---
@@ -1763,9 +1745,8 @@ def render_customer_creation_ui_tab(user_id):
             # Customer creation finished successfully in create_new_customer (step 3)
             # Clear the creation state
             st.session_state.customer_creation_state = None
-            # Show success message
-            st.success(f"Customer {created_customer_data.get('customer_name', 'created')} created successfully! (ID: {created_customer_data.get('display_id', 'N/A')})")
-            st.info("To update your interaction with this customer, please go to 'Choose Existing' section, select the customer, and upload your insights, conversations and data.")
+            # Show one clean success message for the whole flow
+            st.success("Customer saved successfully!")
 
 # Initialize session state
 if not st.session_state.get("messages", None):
