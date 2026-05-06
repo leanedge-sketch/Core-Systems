@@ -290,8 +290,8 @@ def can_show_notification_test_ui():
         return False
 
 @retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=5, min=5, max=20),
+    stop=stop_after_attempt(7),
+    wait=wait_exponential(multiplier=2, min=5, max=60),
     retry=retry_if_exception_type((
         requests.exceptions.Timeout,
         requests.exceptions.ConnectionError,
@@ -399,8 +399,8 @@ def gemini_chat(messages):
         raise requests.exceptions.RequestException(f"Error communicating with Gemini API: {str(e)}")
 
 @retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=5, min=5, max=20),
+    stop=stop_after_attempt(7),
+    wait=wait_exponential(multiplier=2, min=5, max=60),
     retry=retry_if_exception_type((
         requests.exceptions.Timeout,
         requests.exceptions.ConnectionError,
@@ -1287,8 +1287,7 @@ Provide honest results—if a construction vertical is not present, list as "N/A
     try:
         response = gemini_chat(messages)
     except RetryError as e:
-        root_error = e.last_attempt.exception() if e.last_attempt else e
-        raise RuntimeError(f"Profile generation failed after retries: {str(root_error)}") from root_error
+        raise
     except PermissionError:
         raise
     except Exception as e:
@@ -1354,11 +1353,18 @@ def create_new_customer(customer_name: str, user_id: str):
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Generate AI Profile", key=f"generate_profile_{customer_name}", type="primary"):
-                with st.spinner("Generating AI profile... Waiting for API rate limit... retrying if needed"):
+                with st.spinner("API rate limit reached. Waiting for Google to allow the next request... this may take up to a minute."):
                     try:
                         state['profile'] = generate_customer_profile(customer_name, user_id)
                         state['profile_generation_error'] = None
                         state['profile_generated'] = True
+                    except RetryError as e:
+                        root_error = e.last_attempt.exception() if e.last_attempt else e
+                        print(f"Profile generation exhausted retries: {str(root_error)}")
+                        state['profile'] = None
+                        state['profile_generation_error'] = None
+                        state['profile_generated'] = False
+                        st.warning("Please wait 1 minute and try again.")
                     except Exception as e:
                         state['profile'] = None
                         state['profile_generation_error'] = str(e)
@@ -1389,7 +1395,7 @@ def create_new_customer(customer_name: str, user_id: str):
 
     # Step 3: Create database entry (silent background failures except main save failure)
     if state['step'] == 3 and state.get('confirmed'):
-        with st.spinner("Saving customer... Waiting for API rate limit... retrying if needed"):
+        with st.spinner("API rate limit reached. Waiting for Google to allow the next request... this may take up to a minute."):
             if not state.get('profile'):
                 st.error("No generated profile found. Please generate the profile before saving.")
                 state['step'] = 2
@@ -2587,6 +2593,16 @@ def render_update_interaction_ui(user_id: str):
                             'sales_stage_tracker': summary,
                             'next_action_str': summary
                         }
+                    except RetryError as e:
+                        root_error = e.last_attempt.exception() if e.last_attempt else e
+                        print(f"Summarize exhausted retries: {str(root_error)}")
+                        st.warning("Please wait 1 minute and try again.")
+                        st.session_state['current_interaction_analysis'] = {
+                            'new_interaction': new_interaction,
+                            'deal_analysis': "Rate limit reached. Please wait 1 minute and try again.",
+                            'sales_stage_tracker': "Rate limit reached. Please wait 1 minute and try again.",
+                            'next_action_str': "Rate limit reached. Please wait 1 minute and try again."
+                        }
                     except requests.exceptions.HTTPError as e:
                         error_msg = str(e)
                         st.error(f"❌ Gemini API Error: {error_msg}")
@@ -2607,7 +2623,7 @@ def render_update_interaction_ui(user_id: str):
                             'next_action_str': f"Error: {error_msg}"
                         }
                     st.rerun()
-                with st.spinner("Analyzing interaction... Waiting for API rate limit... retrying if needed"):
+                with st.spinner("API rate limit reached. Waiting for Google to allow the next request... this may take up to a minute."):
                     # 1. Retrieve relevant past interactions for context (always use selected customer)
                     relevant_interactions = retrieve_relevant_interactions(customer_id, new_interaction, top_k=3)
                     past_context = "No relevant past interactions found."
@@ -2629,6 +2645,16 @@ def render_update_interaction_ui(user_id: str):
                                 'deal_analysis': open_answer,
                                 'sales_stage_tracker': open_answer,
                                 'next_action_str': open_answer
+                            }
+                        except RetryError as e:
+                            root_error = e.last_attempt.exception() if e.last_attempt else e
+                            print(f"Query answer exhausted retries: {str(root_error)}")
+                            st.warning("Please wait 1 minute and try again.")
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': "Rate limit reached. Please wait 1 minute and try again.",
+                                'sales_stage_tracker': "Rate limit reached. Please wait 1 minute and try again.",
+                                'next_action_str': "Rate limit reached. Please wait 1 minute and try again."
                             }
                         except requests.exceptions.HTTPError as e:
                             error_msg = str(e)
@@ -2662,6 +2688,16 @@ def render_update_interaction_ui(user_id: str):
                                 'deal_analysis': deal_analysis,
                                 'sales_stage_tracker': stage_narrative,
                                 'next_action_str': next_action_str
+                            }
+                        except RetryError as e:
+                            root_error = e.last_attempt.exception() if e.last_attempt else e
+                            print(f"Classic analysis exhausted retries: {str(root_error)}")
+                            st.warning("Please wait 1 minute and try again.")
+                            st.session_state['current_interaction_analysis'] = {
+                                'new_interaction': new_interaction,
+                                'deal_analysis': "Rate limit reached. Please wait 1 minute and try again.",
+                                'sales_stage_tracker': "Rate limit reached. Please wait 1 minute and try again.",
+                                'next_action_str': "Rate limit reached. Please wait 1 minute and try again."
                             }
                         except requests.exceptions.HTTPError as e:
                             error_msg = str(e)
