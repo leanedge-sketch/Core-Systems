@@ -230,6 +230,7 @@ supabase_key = os.environ.get("SUPABASE_KEY", "")
 supabase_client = supabase.create_client(supabase_url, supabase_key)
 
 model = os.getenv('MODEL_CHOICE', 'gpt-3.5-turbo')
+embedding_model = os.getenv('EMBEDDING_MODEL_CHOICE', 'text-embedding-3-small')
 
 # --- Gemini integration (minimal, no new requirements) ---
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openai').lower()
@@ -866,6 +867,18 @@ def llm_chat_primary_fallback(messages):
         print(f"OpenAI primary LLM failed, falling back to Gemini: {str(openai_error)}")
         return gemini_chat(messages)
 
+def llm_embed_primary_fallback(text):
+    """Use OpenAI embeddings as primary, fallback to Gemini embeddings on failure."""
+    try:
+        response = openai_client.embeddings.create(
+            input=text,
+            model=embedding_model
+        )
+        return response.data[0].embedding
+    except Exception as openai_error:
+        print(f"OpenAI primary embedding failed, falling back to Gemini: {str(openai_error)}")
+        return gemini_embed(text)
+
 def generate_customer_id():
     """Generate a unique customer ID"""
     # Generate a UUID for the database
@@ -1421,7 +1434,7 @@ def create_new_customer(customer_name: str, user_id: str):
             # --- Generate embedding for the profile input ---
             interaction_embeddings = []
             try:
-                embedding = gemini_embed(profile_input)
+                embedding = llm_embed_primary_fallback(profile_input)
                 embedding = ensure_vector(embedding)
                 interaction_embeddings = [embedding]  # Always a list of lists
             except Exception as e:
@@ -1553,7 +1566,7 @@ def search_documents(query: str, user_id: str, limit: int = 3):
     try:
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
         def get_embedding():
-            return gemini_embed(query)
+            return llm_embed_primary_fallback(query)
         query_embedding = get_embedding()
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
         def search_supabase():
@@ -2184,12 +2197,18 @@ For every customer you will:
     ]
     return llm_chat_primary_fallback(messages)
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def update_customer_interaction(customer_id: str, new_input: str, new_output: str, user_id: str):
     """Update customer interaction, storing a structured JSON object in the metadata."""
-    # 1. Generate embedding for the new input
-    embedding = gemini_embed(new_input)
-    print("DEBUG: embedding from gemini_embed:", embedding, type(embedding))
+    # 1. Generate embedding for the new input (non-blocking fallback on failure)
+    embedding = None
+    try:
+        embedding = llm_embed_primary_fallback(new_input)
+        print("DEBUG: embedding from gemini_embed:", type(embedding))
+    except RetryError as e:
+        root_error = e.last_attempt.exception() if e.last_attempt else e
+        print(f"update_customer_interaction: embedding retries exhausted: {str(root_error)}")
+    except Exception as e:
+        print(f"update_customer_interaction: embedding generation failed: {str(e)}")
     import json
     import numpy as np
     # --- Robust ensure_vector function ---
@@ -2219,7 +2238,8 @@ def update_customer_interaction(customer_id: str, new_input: str, new_output: st
         # Fallback: wrap as list
         return [float(x)]
 
-    embedding = ensure_vector(embedding)
+    if embedding is not None:
+        embedding = ensure_vector(embedding)
     # 2. Create the new interaction object (as JSON)
     new_interaction_json = {
         "input": new_input,
@@ -2248,7 +2268,9 @@ def update_customer_interaction(customer_id: str, new_input: str, new_output: st
     # 4. Append new data
     updated_inputs = inps + [new_input]
     updated_outputs = outs + [new_output]
-    updated_embs = embs + [embedding]  # list of lists of floats
+    updated_embs = list(embs)
+    if embedding is not None:
+        updated_embs.append(embedding)  # list of lists of floats when available
     updated_metas = metas + [new_interaction_json]  # list of dicts (JSON)
 
     # --- Ensure every embedding is a list of floats ---
@@ -2309,7 +2331,7 @@ def retrieve_relevant_interactions(customer_id: str, query: str, top_k: int = 3)
     """Retrieve the most relevant past interactions using vector similarity, returning full JSON objects."""
     try:
         # Use Gemini embeddings only; never call OpenAI here.
-        query_embedding = gemini_embed(query)
+        query_embedding = llm_embed_primary_fallback(query)
         print("DEBUG: query_embedding from gemini_embed:", type(query_embedding))
         import json
         import numpy as np
@@ -2574,7 +2596,22 @@ def render_update_interaction_ui(user_id: str):
             with col1:
                 if st.button("💾 Save Interaction", key="save_interaction_button"):
                     llm_output = f"Deal Analysis:\n{analysis_data['deal_analysis']}\n\nSales Stage:\n{analysis_data['sales_stage_tracker']}\n\nNext Action:\n{analysis_data.get('next_action_str', analysis_data.get('suggest_next_action'))}"
-                    result = update_customer_interaction(customer_id, analysis_data['new_interaction'], llm_output, user_id)
+                    try:
+                        result = update_customer_interaction(
+                            customer_id,
+                            analysis_data['new_interaction'],
+                            llm_output,
+                            user_id
+                        )
+                    except RetryError as e:
+                        root_error = e.last_attempt.exception() if e.last_attempt else e
+                        print(f"Save interaction retries exhausted: {str(root_error)}")
+                        st.warning("Please wait 1 minute and try again.")
+                        result = None
+                    except Exception as e:
+                        print(f"Save interaction failed: {str(e)}")
+                        st.warning("Could not save interaction right now. Please try again.")
+                        result = None
                     if result:
                         st.success("Interaction saved successfully!")
                         st.session_state['current_interaction_analysis'] = None
@@ -2828,7 +2865,7 @@ def analyze_crm_data(query: str, user_id: str):
             all_interactions.append(metas[i])
     # Get query embedding
     try:
-        query_embedding = gemini_embed(query)
+        query_embedding = llm_embed_primary_fallback(query)
         if isinstance(query_embedding, str):
             import json
             query_embedding = json.loads(query_embedding)
@@ -3644,7 +3681,7 @@ def upload_test_conversation(content: str, user_id: str = "default_user"):
     """Upload a test conversation to the conversation table for RAG testing"""
     try:
         # Generate embedding for the content
-        embedding = gemini_embed(content)
+        embedding = llm_embed_primary_fallback(content)
         
         # Store in Supabase conversation table
         data = {
