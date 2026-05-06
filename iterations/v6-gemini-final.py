@@ -856,28 +856,20 @@ openai_client = get_openai_client()
 memory = get_memory()
 
 def llm_chat_primary_fallback(messages):
-    """Use OpenAI as primary LLM, fallback to Gemini on failure."""
-    try:
-        response = openai_client.chat.completions.create(
-            model=model,
-            messages=messages
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as openai_error:
-        print(f"OpenAI primary LLM failed, falling back to Gemini: {str(openai_error)}")
-        return gemini_chat(messages)
+    """Use OpenAI only for chat completion."""
+    response = openai_client.chat.completions.create(
+        model=model,
+        messages=messages
+    )
+    return (response.choices[0].message.content or "").strip()
 
 def llm_embed_primary_fallback(text):
-    """Use OpenAI embeddings as primary, fallback to Gemini embeddings on failure."""
-    try:
-        response = openai_client.embeddings.create(
-            input=text,
-            model=embedding_model
-        )
-        return response.data[0].embedding
-    except Exception as openai_error:
-        print(f"OpenAI primary embedding failed, falling back to Gemini: {str(openai_error)}")
-        return gemini_embed(text)
+    """Use OpenAI only for embeddings."""
+    response = openai_client.embeddings.create(
+        input=text,
+        model=embedding_model
+    )
+    return response.data[0].embedding
 
 def generate_customer_id():
     """Generate a unique customer ID"""
@@ -1545,19 +1537,11 @@ def get_cached_memories(query, user_id):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_llm_response(messages, model):
     try:
-        try:
-            return openai_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True
-            )
-        except Exception as openai_error:
-            print(f"OpenAI streaming failed, falling back to Gemini: {str(openai_error)}")
-            class DummyChunk:
-                def __init__(self, text):
-                    self.choices = [type('Delta', (), {'delta': type('DeltaContent', (), {'content': text})()})()]
-            text = gemini_chat(messages)
-            yield DummyChunk(text)
+        return openai_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True
+        )
     except Exception as e:
         st.error(f"Error getting AI response: {str(e)}")
         raise
@@ -2653,7 +2637,7 @@ def render_update_interaction_ui(user_id: str):
                     except requests.exceptions.HTTPError as e:
                         error_msg = str(e)
                         st.error(f"❌ Gemini API Error: {error_msg}")
-                        st.warning("⚠️ Please check your GEMINI_API_KEY and try again.")
+                        st.warning("⚠️ Please check your OPENAI_API_KEY and try again.")
                         st.session_state['current_interaction_analysis'] = {
                             'new_interaction': new_interaction,
                             'deal_analysis': f"Error: Could not summarize. {error_msg}",
@@ -2706,7 +2690,7 @@ def render_update_interaction_ui(user_id: str):
                         except requests.exceptions.HTTPError as e:
                             error_msg = str(e)
                             st.error(f"❌ Gemini API Error: {error_msg}")
-                            st.warning("⚠️ Please check your GEMINI_API_KEY and try again.")
+                            st.warning("⚠️ Please check your OPENAI_API_KEY and try again.")
                             st.session_state['current_interaction_analysis'] = {
                                 'new_interaction': new_interaction,
                                 'deal_analysis': f"Error: Could not answer query. {error_msg}",
@@ -2749,7 +2733,7 @@ def render_update_interaction_ui(user_id: str):
                         except requests.exceptions.HTTPError as e:
                             error_msg = str(e)
                             st.error(f"❌ Gemini API Error: {error_msg}")
-                            st.warning("⚠️ Please check your GEMINI_API_KEY and try again. The analysis could not be completed.")
+                            st.warning("⚠️ Please check your OPENAI_API_KEY and try again. The analysis could not be completed.")
                             # Store a partial analysis with error message
                             st.session_state['current_interaction_analysis'] = {
                                 'new_interaction': new_interaction,
