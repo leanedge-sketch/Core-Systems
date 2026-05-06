@@ -4,7 +4,10 @@ venv/
 documents/
 
 .env
+.env.*
 .venv312/
 .venv312
 __pycache__/
 *.py[cod]
+.streamlit/secrets.toml
+.streamlit/config.toml
