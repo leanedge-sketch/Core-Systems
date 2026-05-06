@@ -232,7 +232,7 @@ supabase_client = supabase.create_client(supabase_url, supabase_key)
 model = os.getenv('MODEL_CHOICE', 'gpt-3.5-turbo')
 
 # --- Gemini integration (minimal, no new requirements) ---
-LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini').lower()
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'openai').lower()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', None)
 GEMINI_CHAT_MODEL = os.getenv('GEMINI_CHAT_MODEL', 'gemini-2.5-flash')
 GEMINI_EMBED_MODEL = os.getenv('GEMINI_EMBED_MODEL', 'embedding-001')
@@ -854,6 +854,18 @@ def get_memory():
 openai_client = get_openai_client()
 memory = get_memory()
 
+def llm_chat_primary_fallback(messages):
+    """Use OpenAI as primary LLM, fallback to Gemini on failure."""
+    try:
+        response = openai_client.chat.completions.create(
+            model=model,
+            messages=messages
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as openai_error:
+        print(f"OpenAI primary LLM failed, falling back to Gemini: {str(openai_error)}")
+        return gemini_chat(messages)
+
 def generate_customer_id():
     """Generate a unique customer ID"""
     # Generate a UUID for the database
@@ -1285,7 +1297,7 @@ Provide honest results—if a construction vertical is not present, list as "N/A
     
     # Get response and convert to string
     try:
-        response = gemini_chat(messages)
+        response = llm_chat_primary_fallback(messages)
     except RetryError as e:
         raise
     except PermissionError:
@@ -1520,21 +1532,19 @@ def get_cached_memories(query, user_id):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_llm_response(messages, model):
     try:
-        if LLM_PROVIDER == 'openai':
+        try:
             return openai_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 stream=True
             )
-        elif LLM_PROVIDER == 'gemini':
-            # Gemini does not support streaming, so yield a single chunk
+        except Exception as openai_error:
+            print(f"OpenAI streaming failed, falling back to Gemini: {str(openai_error)}")
             class DummyChunk:
                 def __init__(self, text):
                     self.choices = [type('Delta', (), {'delta': type('DeltaContent', (), {'content': text})()})()]
             text = gemini_chat(messages)
             yield DummyChunk(text)
-        else:
-            raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
     except Exception as e:
         st.error(f"Error getting AI response: {str(e)}")
         raise
@@ -1663,7 +1673,7 @@ def summarize_interactions_with_customer(customer_name, user_id, n=5):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": context}
         ]
-        return gemini_chat(messages)
+        return llm_chat_primary_fallback(messages)
     return f"No interactions found for {customer_name}."
 
 def chat_with_memories(message, user_id):
@@ -1737,7 +1747,7 @@ Customer context:
         ]
         with st.spinner("Thinking..."):
             # For Gemini, just get the full response at once
-            full_response = gemini_chat(messages)
+            full_response = llm_chat_primary_fallback(messages)
             response_placeholder = st.empty()
             response_placeholder.markdown(full_response)
             # Show what conversations were used
@@ -2008,7 +2018,7 @@ Return nothing else.
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "Update the deal tables and generate follow-up questions."}
     ]
-    return gemini_chat(messages)
+    return llm_chat_primary_fallback(messages)
 
 def sales_stage_tracker(new_interaction: str,
                         past_context: str,
@@ -2080,7 +2090,7 @@ ACTION PLAN:
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": "Return the SALES STAGE STATUS block and ACTION PLAN."}
     ]
-    return gemini_chat(messages)
+    return llm_chat_primary_fallback(messages)
 
 def suggest_next_action(new_interaction: str,
                         past_context: str,
@@ -2145,7 +2155,7 @@ Enablers:
 
     # stream or single-chunk depending on provider
     response = get_llm_response(messages, model)
-    return gemini_chat(messages)
+    return llm_chat_primary_fallback(messages)
 
 def analyze_customer_update(update_text: str, customer_id: str, customer_name: str):
     """Analyze customer update with AI reasoning (Brian Tracy 7-stage journey style), using all past interactions and the new interaction."""
@@ -2172,7 +2182,7 @@ For every customer you will:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ]
-    return gemini_chat(messages)
+    return llm_chat_primary_fallback(messages)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def update_customer_interaction(customer_id: str, new_input: str, new_output: str, user_id: str):
@@ -2420,7 +2430,7 @@ Format the analysis to include:
         ]
 
         # Get AI summary
-        summary = gemini_chat(messages)
+        summary = llm_chat_primary_fallback(messages)
 
         # Instead of storing directly, return the content and summary
         # update_customer_interaction(
@@ -2864,7 +2874,7 @@ def analyze_crm_data(query: str, user_id: str):
         {"role": "user", "content": query}
     ]
     try:
-        return gemini_chat(messages)
+        return llm_chat_primary_fallback(messages)
     except Exception as e:
         st.error(f"OpenAI error: {e}")
         return f"OpenAI error: {e}"
@@ -3157,7 +3167,7 @@ def render_rag_test_ui(user_id):
                 "If the context is insufficient, say so."
             )
             # Call Gemini for analysis
-            analyzed_answer = gemini_chat([
+            analyzed_answer = llm_chat_primary_fallback([
                 {"role": "system", "content": "You are an expert CRM assistant."},
                 {"role": "user", "content": prompt}
             ])
@@ -3674,7 +3684,7 @@ def answer_any_query_with_rag(user_query, customer_id, user_id, top_k=3):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_query}
     ]
-    return gemini_chat(messages)
+    return llm_chat_primary_fallback(messages)
 
 # Initialize notification scheduler
 try:
