@@ -3099,7 +3099,9 @@ def render_analysis_ui(user_id: str):
                 st.session_state['current_crm_analysis'] = None
                 st.rerun() # Rerun to refresh the saved queries list (if shown)
             else:
-                st.error("Failed to save analysis")
+                # save_analysis_query already provides a contextual warning.
+                # Keep the analysis visible so user can copy/retry later.
+                st.info("Analysis was generated but could not be persisted right now.")
 
     # Clear the input area after analysis is triggered or saved (optional, can be adjusted)
     # if 'new_analysis_query_input' in st.session_state:
