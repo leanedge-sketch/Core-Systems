@@ -855,8 +855,54 @@ def get_memory():
 openai_client = get_openai_client()
 memory = get_memory()
 
+def _shrink_messages_for_openai(messages, max_total_chars=120000, max_single_message_chars=40000):
+    """Trim oversized message payloads to avoid OpenAI TPM/request-size failures."""
+    if not messages:
+        return messages
+
+    # 1) Cap each individual message first.
+    shrunk = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) > max_single_message_chars:
+            content = content[: max_single_message_chars - 3] + "..."
+        shrunk.append({**msg, "content": content})
+
+    # 2) Cap total size, preserving system prompt and most recent messages.
+    total_chars = sum(len((m.get("content") or "")) for m in shrunk)
+    if total_chars <= max_total_chars:
+        return shrunk
+
+    system_msg = None
+    rest = shrunk
+    if shrunk and shrunk[0].get("role") == "system":
+        system_msg = shrunk[0]
+        rest = shrunk[1:]
+
+    # Keep newest messages first from the end.
+    kept_reversed = []
+    budget = max_total_chars - (len(system_msg.get("content", "")) if system_msg else 0)
+    used = 0
+    for msg in reversed(rest):
+        c = msg.get("content") or ""
+        if used + len(c) <= budget:
+            kept_reversed.append(msg)
+            used += len(c)
+        else:
+            # Keep a truncated tail of the newest oversize message if nothing else fits.
+            remaining = max(0, budget - used)
+            if remaining > 1000:
+                kept_reversed.append({**msg, "content": c[-remaining:]})
+            break
+
+    kept = list(reversed(kept_reversed))
+    if system_msg:
+        return [system_msg] + kept
+    return kept
+
 def llm_chat_primary_fallback(messages):
     """Use OpenAI only for chat completion."""
+    messages = _shrink_messages_for_openai(messages)
     response = openai_client.chat.completions.create(
         model=model,
         messages=messages
@@ -1537,6 +1583,7 @@ def get_cached_memories(query, user_id):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_llm_response(messages, model):
     try:
+        messages = _shrink_messages_for_openai(messages)
         return openai_client.chat.completions.create(
             model=model,
             messages=messages,
