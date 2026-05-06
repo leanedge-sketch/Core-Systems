@@ -16,7 +16,7 @@ from supabase.client import Client, ClientOptions
 from pathlib import Path
 import uuid
 import sys
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError, retry_if_exception_type
 import re
 import openai
 import locale
@@ -280,7 +280,11 @@ def can_show_notification_test_ui():
         # If anything goes wrong, default to safe: hide
         return False
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+)
 def gemini_chat(messages):
     """Call Gemini chat API with OpenAI-style messages."""
     if not GEMINI_API_KEY:
@@ -327,6 +331,14 @@ def gemini_chat(messages):
                 error_json = response.json()
                 error_message = error_json.get('error', {}).get('message', error_text)
                 error_code = error_json.get('error', {}).get('code', response.status_code)
+                if response.status_code == 401:
+                    if "Incorrect API key provided" in error_message or "openai" in error_message.lower():
+                        raise PermissionError(
+                            "Gemini call failed with an OpenAI-style authentication error. "
+                            "Please verify `GEMINI_API_KEY` is set correctly (and not an OpenAI key), "
+                            "and ensure your provider/model settings are aligned."
+                        )
+                    raise PermissionError(f"Gemini authentication failed (401): {error_message}")
                 raise requests.exceptions.HTTPError(
                     f"Gemini API Error {error_code}: {error_message}\n"
                     f"Status Code: {response.status_code}\n"
@@ -768,11 +780,13 @@ def get_memory():
         st.warning("DATABASE_URL not set. Memory features are disabled.")
         return NoopMemory()
 
+    llm_model = GEMINI_CHAT_MODEL if LLM_PROVIDER == 'gemini' else model
+
     config = {
         "llm": {
             "provider": LLM_PROVIDER,
             "config": {
-                "model": model
+                "model": llm_model
             }
         },
         "vector_store": {
@@ -1050,7 +1064,11 @@ def generate_customer_profile(customer_name: str, user_id: str):
     """Generate a customer profile using AI, existing conversations, and web search"""
     # Search relevant documents and memories
     relevant_docs = search_documents(customer_name, user_id)
-    relevant_memories = get_cached_memories(customer_name, user_id)
+    try:
+        relevant_memories = get_cached_memories(customer_name, user_id)
+    except Exception as e:
+        st.warning(f"Memory retrieval failed during profile generation: {str(e)}")
+        relevant_memories = {"results": []}
     
     # Search web for company information
     web_context = search_web_for_company(customer_name)
@@ -1219,7 +1237,15 @@ Provide honest results—if a construction vertical is not present, list as "N/A
     ]
     
     # Get response and convert to string
-    response = gemini_chat(messages)
+    try:
+        response = gemini_chat(messages)
+    except RetryError as e:
+        root_error = e.last_attempt.exception() if e.last_attempt else e
+        raise RuntimeError(f"Profile generation failed after retries: {str(root_error)}") from root_error
+    except PermissionError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Profile generation failed: {str(e)}") from e
     profile_text = response
     return profile_text
 
@@ -1249,6 +1275,7 @@ def create_new_customer(customer_name: str, user_id: str):
             'step': 1,
             'customer_name': customer_name,
             'profile': None,
+            'profile_generation_error': None,
             'confirmed': False
         }
 
@@ -1277,14 +1304,33 @@ def create_new_customer(customer_name: str, user_id: str):
     # Step 2: Generate customer profile
     if state['step'] == 2:
         with st.spinner("Generating customer profile..."):
-            profile = generate_customer_profile(customer_name, user_id)
-            state['profile'] = profile
-            st.write("Generated Profile:")
-            st.write(profile)
+            if state.get('profile') is None and state.get('profile_generation_error') is None:
+                try:
+                    profile = generate_customer_profile(customer_name, user_id)
+                    state['profile'] = profile
+                    state['profile_generation_error'] = None
+                except Exception as e:
+                    state['profile_generation_error'] = str(e)
+                    state['profile'] = (
+                        f"Profile generation unavailable for {customer_name}. "
+                        "Customer can still be created and enriched later."
+                    )
+
+            if state.get('profile_generation_error'):
+                st.error(f"Profile generation failed: {state['profile_generation_error']}")
+                st.warning("You can continue and save the customer without an AI-generated profile.")
+                st.write("Fallback Profile:")
+                st.write(state['profile'])
+            else:
+                st.write("Generated Profile:")
+                st.write(state['profile'])
             
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("Confirm and Add to CRM"):
+                confirm_label = "Confirm and Add to CRM"
+                if state.get('profile_generation_error'):
+                    confirm_label = "Continue Without AI Profile"
+                if st.button(confirm_label):
                     state['confirmed'] = True
                     state['step'] = 3
                     st.rerun()
@@ -1299,11 +1345,17 @@ def create_new_customer(customer_name: str, user_id: str):
         customer_id = generate_customer_id()
         display_id = generate_display_id()
         profile_input = f"Create profile for {customer_name}"
-        profile_output = str(state['profile'])
+        profile_output = str(state.get('profile') or f"Customer {customer_name} created without AI profile.")
         # --- Generate embedding for the profile input ---
-        embedding = gemini_embed(profile_input)
-        embedding = ensure_vector(embedding)
-        interaction_embeddings = [embedding]  # Always a list of lists
+        interaction_embeddings = []
+        try:
+            embedding = gemini_embed(profile_input)
+            embedding = ensure_vector(embedding)
+            interaction_embeddings = [embedding]  # Always a list of lists
+        except Exception as e:
+            st.warning(
+                f"Customer will be saved without embeddings because embedding generation failed: {str(e)}"
+            )
         # Remove debug print
         # print("DEBUG: embedding to be saved:", embedding, type(embedding))
         interaction_json = {
@@ -1693,6 +1745,7 @@ def render_customer_creation_ui_tab(user_id):
                 'step': 1,
                 'customer_name': new_customer_name,
                 'profile': None,
+                'profile_generation_error': None,
                 'confirmed': False
             }
             st.rerun()
