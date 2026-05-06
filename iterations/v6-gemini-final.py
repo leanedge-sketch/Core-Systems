@@ -2995,7 +2995,6 @@ def save_analysis_query(query: str, response: str, user_id: str):
             print(f"save_analysis_query failed on table '{table_name}': {str(e)}")
             continue
 
-    st.warning("Could not persist this analysis query to database. The analysis result is still available on screen.")
     if last_error:
         print(f"save_analysis_query exhausted fallbacks: {str(last_error)}")
     return None
