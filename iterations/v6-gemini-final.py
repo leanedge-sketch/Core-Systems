@@ -215,6 +215,10 @@ class GeminiServiceUnavailableError(Exception):
     """Raised when Gemini returns 503 due to high demand."""
     pass
 
+class GeminiRateLimitError(Exception):
+    """Raised when Gemini returns 429 quota/rate-limit errors."""
+    pass
+
 # Load environment variables
 project_root = Path(__file__).resolve().parent.parent
 dotenv_path = project_root / '.env'
@@ -286,12 +290,13 @@ def can_show_notification_test_ui():
         return False
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=8),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=5, min=5, max=20),
     retry=retry_if_exception_type((
         requests.exceptions.Timeout,
         requests.exceptions.ConnectionError,
-        GeminiServiceUnavailableError
+        GeminiServiceUnavailableError,
+        GeminiRateLimitError
     ))
 )
 def gemini_chat(messages):
@@ -340,6 +345,10 @@ def gemini_chat(messages):
                 error_json = response.json()
                 error_message = error_json.get('error', {}).get('message', error_text)
                 error_code = error_json.get('error', {}).get('code', response.status_code)
+                if response.status_code == 429:
+                    raise GeminiRateLimitError(
+                        f"Gemini rate limit/quota exceeded: {error_message}"
+                    )
                 if response.status_code == 503:
                     raise GeminiServiceUnavailableError(
                         f"Gemini service unavailable (high demand): {error_message}"
@@ -389,6 +398,16 @@ def gemini_chat(messages):
     except requests.exceptions.RequestException as e:
         raise requests.exceptions.RequestException(f"Error communicating with Gemini API: {str(e)}")
 
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=5, min=5, max=20),
+    retry=retry_if_exception_type((
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
+        GeminiServiceUnavailableError,
+        GeminiRateLimitError
+    ))
+)
 def gemini_embed(text):
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set in environment.")
@@ -410,6 +429,18 @@ def gemini_embed(text):
             timeout=30
         )
         if response.status_code != 200:
+            if response.status_code == 429:
+                try:
+                    err_msg = response.json().get('error', {}).get('message', response.text)
+                except Exception:
+                    err_msg = response.text
+                raise GeminiRateLimitError(f"Gemini embedding rate limit/quota exceeded: {err_msg}")
+            if response.status_code == 503:
+                try:
+                    err_msg = response.json().get('error', {}).get('message', response.text)
+                except Exception:
+                    err_msg = response.text
+                raise GeminiServiceUnavailableError(f"Gemini embedding unavailable (high demand): {err_msg}")
             print(f"Gemini embedding API error {response.status_code}: {response.text}")
             response.raise_for_status()
         response_data = response.json()
@@ -1323,7 +1354,7 @@ def create_new_customer(customer_name: str, user_id: str):
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Generate AI Profile", key=f"generate_profile_{customer_name}", type="primary"):
-                with st.spinner("Generating AI profile... Please wait"):
+                with st.spinner("Generating AI profile... Waiting for API rate limit... retrying if needed"):
                     try:
                         state['profile'] = generate_customer_profile(customer_name, user_id)
                         state['profile_generation_error'] = None
@@ -1358,7 +1389,7 @@ def create_new_customer(customer_name: str, user_id: str):
 
     # Step 3: Create database entry (silent background failures except main save failure)
     if state['step'] == 3 and state.get('confirmed'):
-        with st.spinner("Saving customer... Please wait"):
+        with st.spinner("Saving customer... Waiting for API rate limit... retrying if needed"):
             if not state.get('profile'):
                 st.error("No generated profile found. Please generate the profile before saving.")
                 state['step'] = 2
@@ -1403,7 +1434,14 @@ def create_new_customer(customer_name: str, user_id: str):
                         actor = get_actor_display(user_id)
                         created_at = datetime.datetime.now()
                         profile_summary = profile_output
-                        send_new_customer_notification(customer_name, display_id, actor, created_at, profile_summary)
+                        notification_ok = send_new_customer_notification(
+                            customer_name, display_id, actor, created_at, profile_summary
+                        )
+                        if not notification_ok:
+                            print(
+                                f"Warning: New customer notification not delivered for "
+                                f"{customer_name} ({display_id})."
+                            )
                     except Exception as notify_err:
                         print(f"Customer notification failed: {str(notify_err)}")
                     return response.data[0]
@@ -2229,7 +2267,7 @@ def update_customer_interaction(customer_id: str, new_input: str, new_output: st
             except Exception:
                 pass
             actor = get_actor_display(user_id)
-            send_interaction_notification(
+            interaction_notification_ok = send_interaction_notification(
                 customer_name=customer_name,
                 customer_id=customer_id,
                 actor=actor,
@@ -2237,6 +2275,11 @@ def update_customer_interaction(customer_id: str, new_input: str, new_output: st
                 output_text=new_output,
                 timestamp=datetime.datetime.now()
             )
+            if not interaction_notification_ok:
+                print(
+                    f"Warning: Interaction notification not delivered for "
+                    f"customer_id={customer_id}."
+                )
         except Exception:
             pass
         
@@ -2564,7 +2607,7 @@ def render_update_interaction_ui(user_id: str):
                             'next_action_str': f"Error: {error_msg}"
                         }
                     st.rerun()
-                with st.spinner("Analyzing interaction or answering your question..."):
+                with st.spinner("Analyzing interaction... Waiting for API rate limit... retrying if needed"):
                     # 1. Retrieve relevant past interactions for context (always use selected customer)
                     relevant_interactions = retrieve_relevant_interactions(customer_id, new_interaction, top_k=3)
                     past_context = "No relevant past interactions found."
