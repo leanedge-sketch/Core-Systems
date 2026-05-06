@@ -2953,16 +2953,23 @@ def save_analysis_query(query: str, response: str, user_id: str):
 
     # Prefer configurable table; default to user_values (hinted by Supabase error),
     # then fallback to legacy deals table if present.
-    preferred = os.getenv("ANALYSIS_QUERIES_TABLE", "user_values").strip() or "user_values"
+    preferred = os.getenv("ANALYSIS_QUERIES_TABLE", "analysis_queries").strip() or "analysis_queries"
     table_candidates = []
-    for t in [preferred, "user_values", "deals"]:
+    for t in [preferred, "analysis_queries", "user_values", "deals"]:
         if t not in table_candidates:
             table_candidates.append(t)
 
     last_error = None
     for table_name in table_candidates:
         try:
-            if table_name == "user_values":
+            if table_name == "analysis_queries":
+                payload = {
+                    "input_log": query,
+                    "ai_response_log": response,
+                    "created_by": user_id,
+                    "created_at": created_at
+                }
+            elif table_name == "user_values":
                 record_value = {
                     "input_log": query,
                     "ai_response_log": response,
@@ -3001,15 +3008,20 @@ def save_analysis_query(query: str, response: str, user_id: str):
 
 def get_saved_queries(user_id: str):
     """Fetch saved analysis queries with fallback across available tables."""
-    preferred = os.getenv("ANALYSIS_QUERIES_TABLE", "user_values").strip() or "user_values"
+    preferred = os.getenv("ANALYSIS_QUERIES_TABLE", "analysis_queries").strip() or "analysis_queries"
     table_candidates = []
-    for t in [preferred, "user_values", "deals"]:
+    for t in [preferred, "analysis_queries", "user_values", "deals"]:
         if t not in table_candidates:
             table_candidates.append(t)
 
     for table_name in table_candidates:
         try:
-            if table_name == "user_values":
+            if table_name == "analysis_queries":
+                response = supabase_client.table(table_name).select('*').eq('created_by', user_id).order('created_at', desc=True).execute()
+                rows = response.data if response.data else []
+                if rows:
+                    return rows
+            elif table_name == "user_values":
                 response = supabase_client.table(table_name).select('*').eq('user_id', user_id).order('created_at', desc=True).execute()
                 rows = response.data if response.data else []
                 normalized = []
