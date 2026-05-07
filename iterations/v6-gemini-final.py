@@ -2304,10 +2304,60 @@ def update_customer_interaction(customer_id: str, new_input: str, new_output: st
         updated_embs.append(embedding)  # list of lists of floats when available
     updated_metas = metas + [new_interaction_json]  # list of dicts (JSON)
 
-    # --- Ensure every embedding is a list of floats ---
-    updated_embs = [ensure_vector(e) for e in updated_embs]
-    # --- Ensure every metadata is a dict ---
-    updated_metas = [m if isinstance(m, dict) else json.loads(m) for m in updated_metas]
+    # --- Normalize payload to avoid malformed JSON/array errors in Supabase ---
+    # Keep text arrays flat and serializable.
+    updated_inputs = [str(x) for x in updated_inputs if x is not None]
+    updated_outputs = [str(x) for x in updated_outputs if x is not None]
+
+    # Keep metadata as clean JSON objects (JSONB[] compatible).
+    normalized_metas = []
+    for m in updated_metas:
+        if m is None:
+            continue
+        if isinstance(m, dict):
+            normalized_metas.append(m)
+            continue
+        if isinstance(m, str):
+            try:
+                parsed = json.loads(m)
+                if isinstance(parsed, dict):
+                    normalized_metas.append(parsed)
+                else:
+                    normalized_metas.append({"value": parsed})
+            except Exception:
+                normalized_metas.append({"value": m})
+            continue
+        if isinstance(m, (list, tuple)):
+            normalized_metas.append({"value": list(m)})
+            continue
+        normalized_metas.append({"value": str(m)})
+    updated_metas = normalized_metas
+
+    # Keep embeddings as a flat list of vectors with consistent dimension.
+    # PostgreSQL arrays reject jagged nested arrays.
+    normalized_embs = []
+    target_dim = None
+    if embedding is not None:
+        try:
+            target_dim = len(ensure_vector(embedding))
+        except Exception:
+            target_dim = None
+    for e in updated_embs:
+        try:
+            vec = ensure_vector(e)
+            vec = [float(v) for v in vec]
+            if target_dim is None:
+                target_dim = len(vec)
+            if len(vec) == target_dim:
+                normalized_embs.append(vec)
+            else:
+                print(
+                    f"Skipping embedding with mismatched dimension: "
+                    f"expected={target_dim}, got={len(vec)}"
+                )
+        except Exception as emb_err:
+            print(f"Skipping invalid embedding payload: {str(emb_err)}")
+    updated_embs = normalized_embs
 
     # Debug: Print types and sample data before update
     print("DEBUG: Types and lengths before update:")
@@ -2315,7 +2365,10 @@ def update_customer_interaction(customer_id: str, new_input: str, new_output: st
     print("updated_outputs:", type(updated_outputs), len(updated_outputs))
     print("updated_embs:", type(updated_embs), len(updated_embs))
     print("updated_metas:", type(updated_metas), len(updated_metas))
-    print("Sample embedding (last):", updated_embs[-1], type(updated_embs[-1]))
+    if updated_embs:
+        print("Sample embedding (last):", updated_embs[-1], type(updated_embs[-1]))
+    else:
+        print("Sample embedding (last): None")
 
     # 5. Save
     try:
